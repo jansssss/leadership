@@ -126,6 +126,10 @@ def compute_overtime_score(excel_path_or_buffer, dept_filter: str | None = None)
     '총계' + '일별현황_A' 시트 사용
     출력: 부서별 OT점수 DataFrame[부서, OT점수]
     """
+    # ✅ Streamlit UploadedFile 객체 처리
+    if hasattr(excel_path_or_buffer, 'seek'):
+        excel_path_or_buffer.seek(0)
+    
     xls = pd.ExcelFile(excel_path_or_buffer)
     if "총계" not in xls.sheet_names or "일별현황_A" not in xls.sheet_names:
         raise ValueError("엑셀에 '총계' 또는 '일별현황_A' 시트가 없습니다.")
@@ -220,55 +224,15 @@ def _to_days(x, hours_per_day=HOURS_PER_DAY):
     m = re.search(r"(\d+(\.\d+)?)", s)
     return float(m.group(1)) if m else 0.0
 
-def _pick_dept_col_leave(df):
-    for cand in ["부서", "소속", "부서명", "부서(소속)", "실/센터", "실센터", "본부", "기본정보"]:
-        if cand in df.columns:
-            return cand
-    # 최선
-    best, score = None, -1.0
-    for c in df.columns:
-        rate = df[c].astype(str).apply(lambda x: x.strip() != "" and not x.strip().isdigit()).mean()
-        if rate > score:
-            score, best = rate, c
-    return best
-
-def _pick_name_col_leave(df):
-    for cand in ["이름", "성명", "사원명", "직원명", "Name", "name"]:
-        if cand in df.columns:
-            return cand
-    best, score = None, -1
-    for c in df.columns:
-        m = df[c].astype(str).str.len().mean()
-        if m > score:
-            score, best = m, c
-    return best
-
-def _pick_granted_col(df):
-    for cand in ["부여", "부여일수", "연차부여", "발생", "발생일수", "총연차", "연차(부여)", "부여(일수)"]:
-        if cand in df.columns:
-            return cand
-    return None
-
-def _pick_used_col(df):
-    for cand in ["사용", "사용일수", "연차사용", "사용(일수)", "사용일", "사용수", "사용횟수"]:
-        if cand in df.columns:
-            return cand
-    return None
-
-def _pick_remaining_col(df):
-    for cand in ["잔여", "잔여일수", "잔여연차", "미사용", "미사용일수", "남은", "남은일수"]:
-        if cand in df.columns:
-            return cand
-    return None
-
-
-
-
 def compute_leave_score(excel_path_or_buffer, dept_filter: str | None = None, sheet_name: str | None = None):
     """
     연차 사용현황 파일 → 부서별 연차점수 DataFrame[부서, 연차점수]
     - 헤더가 병합되어 'Unnamed: n'이 많은 경우를 대비해: 헤더 복구 + 상단 N행에서 '부여/사용/잔여' 마커 스캔
     """
+    # ✅ Streamlit UploadedFile 객체 처리
+    if hasattr(excel_path_or_buffer, 'seek'):
+        excel_path_or_buffer.seek(0)
+    
     # 1) 시트 선택
     xls = pd.ExcelFile(excel_path_or_buffer)
     use_sheet = sheet_name if (sheet_name and sheet_name in xls.sheet_names) else xls.sheet_names[0]
@@ -394,17 +358,6 @@ def compute_leave_score(excel_path_or_buffer, dept_filter: str | None = None, sh
     df["_부서"] = df[dept_col].apply(_norm)
     df["_이름"] = df[name_col].apply(_norm)
 
-    def _to_days(x, hours_per_day=HOURS_PER_DAY):
-        if x is None or (isinstance(x, float) and np.isnan(x)): return 0.0
-        if isinstance(x, (int, float)): return float(x)
-        s = str(x).strip()
-        if re.match(r"^\s*\d{1,3}:\d{2}\s*$", s):  # HH:MM
-            h, m = s.split(":")
-            hours = int(h) + int(m) / 60.0
-            return hours / hours_per_day if hours_per_day > 0 else 0.0
-        m = re.search(r"(\d+(\.\d+)?)", s)
-        return float(m.group(1)) if m else 0.0
-
     if grant_col:  df["_부여"] = df[grant_col].apply(_to_days)
     if used_col:   df["_사용"] = df[used_col].apply(_to_days)
     if remain_col: df["_잔여"] = df[remain_col].apply(_to_days)
@@ -446,7 +399,6 @@ def compute_leave_score(excel_path_or_buffer, dept_filter: str | None = None, sh
         grp = grp[grp["부서"].str.contains(dept_filter, na=False)]
     return grp[["부서", "연차점수"]]
 
-
 # -----------------------
 # 통합 최종 계산
 # -----------------------
@@ -462,25 +414,30 @@ def compute_total_score(overtime_file, leave_file, dept_filter: str | None = Non
     return merged
 
 # -----------------------
-# 스크립트 실행
+# 스크립트 직접 실행 (선택사항)
 # -----------------------
 if __name__ == "__main__":
+    # 로컬에서 직접 테스트할 때만 사용
+    # Streamlit에서는 이 부분이 실행되지 않습니다
     print("현재 작업 디렉터리:", os.getcwd())
 
     # ❗ 여기를 실제 파일 경로로 바꾸세요(같은 폴더면 파일명만 사용 가능)
-    ot_file = r"시간외근무_현황_전체 (6월~12월).xlsx"        # 예: r"C:\Users\...\시간외근무_현황_전체 (6월~12월).xlsx"
-    lv_file = r"2025년_연차설정+정보_1423.xlsx"             # 예: r"C:\Users\...\2025년_연차설정+정보_1423.xlsx"
+    ot_file = r"시간외근무_현황_전체 (6월~12월).xlsx"
+    lv_file = r"2025년_연차설정+정보_1423.xlsx"
 
     # 특정 부서만 보려면 입력(예: "전략기획")
     dept = None
     # 연차 시트명 지정 필요시(없으면 첫 시트 사용)
     leave_sheet = None
 
-    result = compute_total_score(ot_file, lv_file, dept_filter=dept, leave_sheet=leave_sheet)
-    print("\n=== 최종 리더십 점수 (–6~+6) ===")
-    print(result.to_string(index=False))
+    try:
+        result = compute_total_score(ot_file, lv_file, dept_filter=dept, leave_sheet=leave_sheet)
+        print("\n=== 최종 리더십 점수 (–6~+6) ===")
+        print(result.to_string(index=False))
 
-    # CSV 저장 (엑셀에서 바로 열 수 있도록 utf-8-sig)
-    out_path = "leadership_total_results.csv"
-    result.to_csv(out_path, index=False, encoding="utf-8-sig")
-    print(f"\n저장 완료: {os.path.abspath(out_path)}")
+        # CSV 저장 (엑셀에서 바로 열 수 있도록 utf-8-sig)
+        out_path = "leadership_total_results.csv"
+        result.to_csv(out_path, index=False, encoding="utf-8-sig")
+        print(f"\n저장 완료: {os.path.abspath(out_path)}")
+    except Exception as e:
+        print(f"\n오류 발생: {e}")
