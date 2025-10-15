@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-리더십 평가 통합 점수 산출기 (전체 파일)
-- 초과근무 점수(–3~+3) + 연차 점수(–3~+3) = 최종 점수(–6~+6)
-- 초과근무: '총계' + '일별현황_A' 시트 사용 (부서/직급/이름/환산/신청일 등 자동 감지)
-- 연차: 첫 시트(또는 지정 시트)에서 부서/이름/부여/사용/잔여 자동 감지
-- 결과: 부서별 OT점수, 연차점수, 최종점수 출력 및 CSV 저장
+리더십 평가 통합 점수 산출기 (가중 통합안, –6~+6 유지)
+- 구성: 초과근무(–3~+3) + 연차(–3~+3) + 직원효율화(–3~+3)
+- 최종 점수 = w_ot*OT + w_lv*연차 + w_eff*효율, 기본 (0.4, 0.3, 0.3)
+- 효율 산정: 업로드 파일(예: 실센터장_리더십_평가_2025년_2025-10-15.xlsx)에서
+  [인원, 총 프로젝트 수, 실제 달성점수] 자동 감지 → 팀 단위 집계 → CE 산출 → Residual(%) → 점수화
 """
 
 import os
@@ -16,9 +16,9 @@ from datetime import datetime
 # -----------------------
 # 공통 설정
 # -----------------------
-HOURS_PER_DAY = 8.0                # 1일 근무시간 (기관 표준에 맞게 조정)
-BASE_MONTHLY_HOURS = 160           # 월 기준 근로시간
-RANK_WEIGHTS = {                   # 직급 가중치(미정의는 1.0)
+HOURS_PER_DAY = 8.0
+BASE_MONTHLY_HOURS = 160
+RANK_WEIGHTS = {
     "책임": 1.2,
     "선임": 1.0,
     "주임": 0.9,
@@ -32,7 +32,6 @@ def _norm(s):
     return str(s).strip() if pd.notna(s) else ""
 
 def parse_hhmm_to_minutes(x):
-    """'64:00' -> 분(int); 숫자는 분으로 간주"""
     if pd.isna(x):
         return 0
     if isinstance(x, str) and ":" in x:
@@ -46,7 +45,6 @@ def parse_hhmm_to_minutes(x):
     return 0
 
 def detect_months_from_dates(series):
-    """날짜열에서 (연-월) 유니크 개수 → 1~12 범위 월 수 산정"""
     months = set()
     for v in series.dropna():
         try:
@@ -56,6 +54,13 @@ def detect_months_from_dates(series):
             pass
     cnt = len(months) if months else 1
     return min(max(cnt, 1), 12)
+
+def _min_max_norm(s):
+    s = pd.to_numeric(s, errors="coerce")
+    vmin, vmax = s.min(), s.max()
+    if pd.isna(vmin) or pd.isna(vmax) or vmax - vmin == 0:
+        return pd.Series([0.5]*len(s), index=s.index)
+    return (s - vmin) / (vmax - vmin)
 
 # 날짜/부서/시간 컬럼 자동 감지 (초과근무 쪽)
 def _pick_date_col(df):
@@ -72,7 +77,6 @@ def _pick_dept_col_daily(df):
     for cand in ["기본정보", "부서", "소속"]:
         if cand in df.columns:
             return cand
-    # 최선: 텍스트 비율이 높은 열
     best_col, best_score = None, -1.0
     for c in df.columns:
         s = df[c].astype(str)
@@ -85,7 +89,6 @@ def _pick_time_col(df):
     for c in df.columns:
         if "환산" in str(c):
             return c
-    # HH:MM 패턴이 많은 열 선택
     best_col, best_rate = None, -1.0
     for c in df.columns:
         s = df[c].astype(str)
@@ -97,10 +100,10 @@ def _pick_time_col(df):
 # -----------------------
 # 초과근무 → 점수(–3~+3)
 # -----------------------
-def residual_to_score_ot(residual_pct: float) -> float:
+def residual_to_score_step(residual_pct: float) -> float:
     """
-    Residual(%) → OT 점수(–3~+3)
-    (기관 방침에 맞게 경계 조절 가능)
+    공통 계단식 점수 매핑(OT/효율 공용): Residual(%) → –3~+3
+    음수가 '좋음'(효율적/OT절감)이라는 철학(잔차가 음수일수록 가점) 유지
     """
     if residual_pct <= -10:
         return 3.0
@@ -122,14 +125,10 @@ def residual_to_score_ot(residual_pct: float) -> float:
         return -3.0
 
 def compute_overtime_score(excel_path_or_buffer, dept_filter: str | None = None):
-    """
-    '총계' + '일별현황_A' 시트 사용
-    출력: 부서별 OT점수 DataFrame[부서, OT점수]
-    """
-    # ✅ Streamlit UploadedFile 객체 처리
+    # Streamlit UploadedFile 대응
     if hasattr(excel_path_or_buffer, 'seek'):
         excel_path_or_buffer.seek(0)
-    
+
     xls = pd.ExcelFile(excel_path_or_buffer)
     if "총계" not in xls.sheet_names or "일별현황_A" not in xls.sheet_names:
         raise ValueError("엑셀에 '총계' 또는 '일별현황_A' 시트가 없습니다.")
@@ -197,7 +196,7 @@ def compute_overtime_score(excel_path_or_buffer, dept_filter: str | None = None)
     dept_table["AOR(%)"] = dept_table.apply(lambda r: calc_aor(r["OT(시간)"], r["AH(시간)"]) * 100.0, axis=1)
     dept_table["EOR(%)"] = dept_table["AH(시간)"].apply(calc_eor)
     dept_table["Residual(%)"] = dept_table["AOR(%)"] - dept_table["EOR(%)"]
-    dept_table["OT점수"] = dept_table["Residual(%)"].apply(residual_to_score_ot)
+    dept_table["OT점수"] = dept_table["Residual(%)"].apply(residual_to_score_step)
 
     ot_out = dept_table[["부서", "OT점수"]]
     if dept_filter:
@@ -211,7 +210,6 @@ def _looks_hhmm(val: str) -> bool:
     return bool(re.match(r"^\s*\d{1,3}:\d{2}\s*$", str(val or "")))
 
 def _to_days(x, hours_per_day=HOURS_PER_DAY):
-    """숫자=일수, 'HH:MM'은 시간/8로 일수 환산, 그 외는 숫자 추출"""
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return 0.0
     if isinstance(x, (int, float)):
@@ -225,72 +223,49 @@ def _to_days(x, hours_per_day=HOURS_PER_DAY):
     return float(m.group(1)) if m else 0.0
 
 def compute_leave_score(excel_path_or_buffer, dept_filter: str | None = None, sheet_name: str | None = None):
-    """
-    연차 사용현황 파일 → 부서별 연차점수 DataFrame[부서, 연차점수]
-    - 헤더가 병합되어 'Unnamed: n'이 많은 경우를 대비해: 헤더 복구 + 상단 N행에서 '부여/사용/잔여' 마커 스캔
-    """
-    # ✅ Streamlit UploadedFile 객체 처리
     if hasattr(excel_path_or_buffer, 'seek'):
         excel_path_or_buffer.seek(0)
-    
-    # 1) 시트 선택
+
     xls = pd.ExcelFile(excel_path_or_buffer)
     use_sheet = sheet_name if (sheet_name and sheet_name in xls.sheet_names) else xls.sheet_names[0]
 
-    # 2) 1차 로드(일반 헤더)
     df = pd.read_excel(excel_path_or_buffer, sheet_name=use_sheet)
     df.columns = [str(c).strip() for c in df.columns]
 
-    # -----------------------------
-    # 헤더 복구 유틸
-    # -----------------------------
     def _rebuild_header_by_rowindex(idx: int):
-        # idx행을 헤더로 삼아 재로딩
         df2 = pd.read_excel(excel_path_or_buffer, sheet_name=use_sheet, header=idx)
-        # 멀티인덱스면 결합
         if isinstance(df2.columns, pd.MultiIndex):
             df2.columns = [" ".join([_norm(x) for x in tup if _norm(x)]).strip() for tup in df2.columns.to_list()]
         df2.columns = [c.replace("이름(ID)", "이름").strip() for c in df2.columns]
         return df2
 
     def _looks_broken_header(df0: pd.DataFrame) -> bool:
-        # 'Unnamed:' 비율 높고, '부여/사용/잔여' 같은 키워드를 컬럼에서 찾지 못하면 깨진 헤더로 판단
         unnamed_ratio = np.mean([c.startswith("Unnamed:") for c in df0.columns])
         has_keywords = any(k in " ".join(df0.columns) for k in ["부여", "사용", "잔여"])
         return (unnamed_ratio > 0.3) and (not has_keywords)
 
-    # 3) 헤더가 깨진 경우 상단 6행까지 스캔하여 가장 적절한 행을 헤더로 승격
     if _looks_broken_header(df):
         raw = pd.read_excel(excel_path_or_buffer, sheet_name=use_sheet, header=None)
         candidate = None
         best_score = -1
-        for i in range(min(6, len(raw))):  # 상단 6행 탐색
+        for i in range(min(6, len(raw))):
             row = raw.iloc[i].astype(str).fillna("")
             score = 0
             text = " ".join(row.tolist())
-            # 키워드 가중치
             if re.search(r"부서|소속|부서명|기본정보", text): score += 2
             if re.search(r"이름|성명|사원명|이름\(ID\)", text): score += 2
             if re.search(r"부여|사용|잔여|연차", text): score += 2
-            # Unnamed 컬럼 비율 낮을수록 가점
             unnamed_rate = np.mean([str(x).startswith("Unnamed") for x in row])
-            score += max(0, 1.5 - unnamed_rate)  # 0~1.5 가산
+            score += max(0, 1.5 - unnamed_rate)
             if score > best_score:
                 best_score, candidate = score, i
-        if candidate is not None:
-            df = _rebuild_header_by_rowindex(candidate)
-        else:
-            # 못 찾았으면 0행으로 시도
-            df = _rebuild_header_by_rowindex(0)
+        df = _rebuild_header_by_rowindex(candidate if candidate is not None else 0)
 
-    # 4) 열 이름 정리
     df.columns = [c.replace("이름(ID)", "이름").strip() for c in df.columns]
 
-    # 5) 컬럼 자동 감지 (연차용)
     def _pick_dept_col_leave(df_):
         for cand in ["부서", "소속", "부서명", "부서(소속)", "실/센터", "실센터", "본부", "기본정보"]:
             if cand in df_.columns: return cand
-        # 최선
         best, score = None, -1.0
         for c in df_.columns:
             rate = df_[c].astype(str).apply(lambda x: x.strip() != "" and not x.strip().isdigit()).mean()
@@ -309,11 +284,9 @@ def compute_leave_score(excel_path_or_buffer, dept_filter: str | None = None, sh
         return best
 
     def _pick_granted_col(df_):
-        # ① 컬럼명 키워드
         for cand in ["부여", "부여일수", "연차부여", "발생", "발생일수", "총연차", "연차(부여)", "부여(일수)"]:
             hits = [c for c in df_.columns if cand in c]
             if hits: return hits[0]
-        # ② 상단 N행 마커 스캔
         for c in df_.columns:
             if df_[c].astype(str).head(6).str.contains("부여|발생|총연차").any():
                 return c
@@ -343,18 +316,10 @@ def compute_leave_score(excel_path_or_buffer, dept_filter: str | None = None, sh
     used_col = _pick_used_col(df)
     remain_col = _pick_remaining_col(df)
 
-    missing = []
-    if not dept_col: missing.append("부서")
-    if not name_col: missing.append("이름")
-    # 최소 2개 확보(부여/사용/잔여)
     have_cnt = sum([grant_col is not None, used_col is not None, remain_col is not None])
     if have_cnt < 2:
-        raise ValueError(
-            "연차 시트에서 다음 정보를 찾지 못했습니다: 부여/사용/잔여 중 최소 2개\n"
-            f"열 목록: {list(df.columns)}"
-        )
+        raise ValueError("연차 시트에서 부여/사용/잔여 중 최소 2개를 찾지 못했습니다.")
 
-    # 6) 수치화 및 파생 보정
     df["_부서"] = df[dept_col].apply(_norm)
     df["_이름"] = df[name_col].apply(_norm)
 
@@ -383,7 +348,6 @@ def compute_leave_score(excel_path_or_buffer, dept_filter: str | None = None, sh
 
     grp["잔여율(%)"] = (grp["잔여합"] / grp["부여합"].replace(0, np.nan) * 100.0).fillna(0.0).clip(0, 100)
 
-    # 잔여율 → 점수(–3~+3)
     def leave_score(remain_pct):
         if remain_pct <= 2: return 3.0
         elif remain_pct <= 5: return 2.0
@@ -400,42 +364,213 @@ def compute_leave_score(excel_path_or_buffer, dept_filter: str | None = None, sh
     return grp[["부서", "연차점수"]]
 
 # -----------------------
-# 통합 최종 계산
+# 직원효율화 → 점수(–3~+3)
 # -----------------------
-def compute_total_score(overtime_file, leave_file, dept_filter: str | None = None, leave_sheet: str | None = None):
+def _pick_efficiency_columns(df):
+    # 그룹키
+    dept_candidates = ["부서", "본부", "실/센터", "소속", "부서명"]
+    dept_col = next((c for c in dept_candidates if c in df.columns), None)
+    if dept_col is None:
+        # 가장 텍스트 비율 높은 열을 부서대용
+        best, score = None, -1
+        for c in df.columns:
+            rate = df[c].astype(str).apply(lambda x: x.strip() != "" and not x.strip().isdigit()).mean()
+            if rate > score:
+                score, best = rate, c
+        dept_col = best
+
+    # 인원
+    ppl_candidates = ["소속 직원 수", "인원", "인원수", "직원수", "구성원수"]
+    ppl_col = next((c for c in ppl_candidates if c in df.columns), None)
+
+    # 총 프로젝트 수
+    prj_candidates = ["총 프로젝트 수", "프로젝트 수", "프로젝트총계", "총프로젝트수"]
+    prj_col = next((c for c in prj_candidates if c in df.columns), None)
+
+    # 실제 달성점수
+    score_candidates = ["실제 달성점수", "총점", "달성점수", "성과점수"]
+    ach_col = next((c for c in score_candidates if c in df.columns), None)
+
+    return dept_col, ppl_col, prj_col, ach_col
+
+def _to_num(x):
+    if pd.isna(x): return 0.0
+    if isinstance(x, (int, float)): return float(x)
+    m = re.search(r"-?\d+(\.\d+)?", str(x))
+    return float(m.group()) if m else 0.0
+
+def compute_efficiency_score(eff_file, dept_filter: str | None = None,
+                             sheet_name: str | None = None,
+                             mode: str = "CE", alpha: float = 0.5):
+    # Streamlit UploadedFile 대응
+    if hasattr(eff_file, 'seek'):
+        eff_file.seek(0)
+
+    xls = pd.ExcelFile(eff_file)
+    use_sheet = sheet_name if (sheet_name and sheet_name in xls.sheet_names) else xls.sheet_names[0]
+    df = pd.read_excel(eff_file, sheet_name=use_sheet)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    dept_col, ppl_col, prj_col, ach_col = _pick_efficiency_columns(df)
+    missing = []
+    if dept_col is None: missing.append("부서/소속 구분 열")
+    if ppl_col is None: missing.append("인원")
+    if prj_col is None: missing.append("총 프로젝트 수")
+    if ach_col is None: missing.append("실제 달성점수")
+    if missing:
+        raise ValueError(f"직원효율화 산정에 필요한 컬럼을 찾지 못했습니다: {missing}\n열 목록: {list(df.columns)}")
+
+    work = pd.DataFrame({
+        "부서": df[dept_col].apply(_norm),
+        "인원": df[ppl_col].apply(_to_num),
+        "총 프로젝트 수": df[prj_col].apply(_to_num),
+        "실제 달성점수": df[ach_col].apply(_to_num),
+    })
+    work["인원"] = work["인원"].clip(lower=0)
+
+    # 팀 단위 집계(부서 동일명 합산)
+    grp = work.groupby("부서", dropna=False).agg(
+        인원=("인원", "sum"),
+        총프로젝트=("총 프로젝트 수", "sum"),
+        실제달성=("실제 달성점수", "sum"),
+    ).reset_index()
+
+    # 인원 0 대비 안전 처리
+    grp = grp[grp["인원"] > 0].copy()
+    grp["PE"] = grp["총프로젝트"] / grp["인원"]
+    grp["SE"] = grp["실제달성"] / grp["인원"]
+
+    # 정규화
+    grp["PE_norm"] = _min_max_norm(grp["PE"])
+    grp["SE_norm"] = _min_max_norm(grp["SE"])
+
+    # 효율 스코어
+    mode = (mode or "CE").upper()
+    if mode == "PE":
+        grp["EFF_raw"] = grp["PE_norm"]
+    elif mode == "SE":
+        grp["EFF_raw"] = grp["SE_norm"]
+    else:
+        grp["EFF_raw"] = alpha * grp["PE_norm"] + (1 - alpha) * grp["SE_norm"]
+
+    # AOR/EOR 방식(OT 철학 동일)
+    org_eff_sum = grp["EFF_raw"].sum()
+    org_people_sum = grp["인원"].sum()
+    org_avg_people = grp["인원"].replace(0, np.nan).mean()
+
+    def aor_eff(team_eff):
+        # team_eff / (team_eff + 1) 를 확률형으로 해석 (스케일-독립적)
+        denom = team_eff + 1.0
+        return (team_eff / denom) if denom > 0 else 0.0
+
+    org_eff_rate = aor_eff(org_eff_sum / max(len(grp), 1))  # 조직 평균수준으로 스케일링
+
+    def eor_eff(team_people):
+        if team_people <= 0:
+            return org_eff_rate * 100.0
+        e = org_eff_rate * (org_avg_people / team_people) * 100.0
+        return max(0.0, min(100.0, e))
+
+    grp["AOR_EFF(%)"] = grp["EFF_raw"].apply(lambda x: aor_eff(x) * 100.0)
+    grp["EOR_EFF(%)"] = grp["인원"].apply(eor_eff)
+    grp["Residual_EFF(%)"] = grp["AOR_EFF(%)"] - grp["EOR_EFF(%)"]
+
+    # 점수화(–3~+3)
+    grp["직원효율화점수"] = grp["Residual_EFF(%)"].apply(residual_to_score_step)
+
+    if dept_filter:
+        grp = grp[grp["부서"].str.contains(dept_filter, na=False)]
+
+    # 참고치 포함 반환
+    return grp[["부서", "직원효율화점수", "PE", "SE", "인원", "총프로젝트", "실제달성"]].rename(
+        columns={"PE": "참고(PE)", "SE": "참고(SE)", "총프로젝트": "총 프로젝트 수", "실제달성": "실제 달성점수"}
+    )
+
+# -----------------------
+# 통합 최종 계산(가중 통합)
+# -----------------------
+def compute_total_score(overtime_file,
+                        leave_file,
+                        efficiency_file=None,
+                        dept_filter: str | None = None,
+                        leave_sheet: str | None = None,
+                        eff_sheet: str | None = None,
+                        mode: str = "CE",
+                        alpha: float = 0.5,
+                        weights: tuple[float, float, float] = (0.4, 0.3, 0.3)):
+    """
+    최종 –6~+6 유지: w_ot*OT + w_lv*연차 + w_eff*효율  (각 항목 –3~+3)
+    efficiency_file 미제공 시 효율=0점 처리
+    """
+    w_ot, w_lv, w_eff = weights
+    if not np.isclose(w_ot + w_lv + w_eff, 1.0):
+        raise ValueError(f"weights 합은 1이어야 합니다. 현재 합={w_ot + w_lv + w_eff}")
+
     ot = compute_overtime_score(overtime_file, dept_filter)
     lv = compute_leave_score(leave_file, dept_filter, sheet_name=leave_sheet)
-    merged = pd.merge(ot, lv, on="부서", how="outer").fillna(0.0)
-    merged["최종점수(–6~+6)"] = merged["OT점수"] + merged["연차점수"]
-    # 보기 좋게
-    merged = merged[["부서", "OT점수", "연차점수", "최종점수(–6~+6)"]].sort_values(
-        by=["최종점수(–6~+6)", "OT점수", "연차점수"], ascending=[False, False, False]
+
+    if efficiency_file is not None:
+        eff = compute_efficiency_score(efficiency_file, dept_filter, sheet_name=eff_sheet, mode=mode, alpha=alpha)
+        merged = pd.merge(pd.merge(ot, lv, on="부서", how="outer"), eff, on="부서", how="outer")
+    else:
+        merged = pd.merge(ot, lv, on="부서", how="outer")
+        merged["직원효율화점수"] = 0.0
+        merged["참고(PE)"] = np.nan
+        merged["참고(SE)"] = np.nan
+        merged["인원"] = np.nan
+        merged["총 프로젝트 수"] = np.nan
+        merged["실제 달성점수"] = np.nan
+
+    merged = merged.fillna(0.0)
+
+    # 가중 합산(–6~+6 유지)
+    merged["최종점수(–6~+6)"] = (
+        w_ot * merged["OT점수"] +
+        w_lv * merged["연차점수"] +
+        w_eff * merged["직원효율화점수"]
+    )
+
+    # 보기 좋게 정렬
+    ordered = merged[[
+        "부서", "OT점수", "연차점수", "직원효율화점수", "최종점수(–6~+6)",
+        "참고(PE)", "참고(SE)", "인원", "총 프로젝트 수", "실제 달성점수"
+    ]].sort_values(
+        by=["최종점수(–6~+6)", "OT점수", "연차점수", "직원효율화점수"],
+        ascending=[False, False, False, False]
     ).reset_index(drop=True)
-    return merged
+
+    return ordered
 
 # -----------------------
-# 스크립트 직접 실행 (선택사항)
+# 스크립트 직접 실행 (선택)
 # -----------------------
 if __name__ == "__main__":
-    # 로컬에서 직접 테스트할 때만 사용
-    # Streamlit에서는 이 부분이 실행되지 않습니다
     print("현재 작업 디렉터리:", os.getcwd())
 
-    # ❗ 여기를 실제 파일 경로로 바꾸세요(같은 폴더면 파일명만 사용 가능)
+    # 예시 파일 경로(환경에 맞게 수정)
     ot_file = r"시간외근무_현황_전체 (6월~12월).xlsx"
     lv_file = r"2025년_연차설정+정보_1423.xlsx"
+    eff_file = r"실센터장_리더십_평가_2025년_2025-10-15.xlsx"  # 직원효율화 원본
 
-    # 특정 부서만 보려면 입력(예: "전략기획")
     dept = None
-    # 연차 시트명 지정 필요시(없으면 첫 시트 사용)
     leave_sheet = None
+    eff_sheet = None
 
     try:
-        result = compute_total_score(ot_file, lv_file, dept_filter=dept, leave_sheet=leave_sheet)
-        print("\n=== 최종 리더십 점수 (–6~+6) ===")
+        result = compute_total_score(
+            overtime_file=ot_file,
+            leave_file=lv_file,
+            efficiency_file=eff_file,
+            dept_filter=dept,
+            leave_sheet=leave_sheet,
+            eff_sheet=eff_sheet,
+            mode="CE",          # "PE" | "SE" | "CE"
+            alpha=0.5,          # CE 가중(프로젝트 대비 성과 비중)
+            weights=(0.4,0.3,0.3)  # w_ot, w_lv, w_eff (합=1)
+        )
+        print("\n=== 최종 리더십 점수 (–6~+6, 가중 통합) ===")
         print(result.to_string(index=False))
 
-        # CSV 저장 (엑셀에서 바로 열 수 있도록 utf-8-sig)
         out_path = "leadership_total_results.csv"
         result.to_csv(out_path, index=False, encoding="utf-8-sig")
         print(f"\n저장 완료: {os.path.abspath(out_path)}")
