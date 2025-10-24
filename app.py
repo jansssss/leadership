@@ -1,105 +1,224 @@
-# -*- coding: utf-8 -*-
-import io
-import numpy as np
-import pandas as pd
 import streamlit as st
-from leadership_total import (
-    compute_total_score,
-    DEFAULT_GRADE_WEIGHTS,
+import pandas as pd
+from leadership_total import compute_total_score
+
+# 페이지 설정
+st.set_page_config(
+    page_title="리더십 점수 자동 산출기",
+    page_icon="📊",
+    layout="wide"
 )
 
-st.set_page_config(page_title="리더십 점수(OT+연차+효율화)", layout="wide")
+# 타이틀
+st.title("📊 리더십 점수 자동 산출기")
+st.markdown("---")
 
-st.title("리더십 점수 통합 대시보드")
-st.caption("OT + 연차 + 효율화(프로젝트 관리 지수) 3축으로 산출합니다. 효율화 점수 범위: -3 ~ +3.")
+# 설명
+with st.expander("ℹ️ 사용 방법", expanded=False):
+    st.markdown("""
+    ### 📋 사용 방법
+    1. **초과근무 파일** 업로드 (엑셀 형식, '총계'와 '일별현황_A' 시트 필요)
+    2. **연차 파일** 업로드 (엑셀 형식)
+    3. 필요시 부서 필터 입력
+    4. **점수 계산** 버튼 클릭
+    
+    ### 📈 점수 기준 (개정)
+    - **OT 점수**: **–1 ~ +2점** (Residual 기반)
+    - **연차 점수**: **–1 ~ +1점** (잔여율 기반)
+    - **최종 점수**: **–2 ~ +3점** (OT + 연차)
+    """)
 
-with st.sidebar:
-    st.header("① 파일 업로드")
-    ot_file = st.file_uploader("OT(초과근무) 파일 (xlsx/xls/csv)", type=["xlsx","xls","csv"], key="ot")
-    lv_file = st.file_uploader("연차 사용 파일 (xlsx/xls/csv)", type=["xlsx","xls","csv"], key="lv")
-    prj_file = st.file_uploader("프로젝트 실적 파일 (xlsx/xls/csv)", type=["xlsx","xls","csv"], key="prj")
+# 사이드바 설정
+st.sidebar.header("⚙️ 설정")
 
-    st.header("② 컬럼 매핑(선택)")
-    st.caption("파일 컬럼명이 다를 때 지정하세요. 지정 안 하면 기본값을 추정 시도합니다.")
-    colmap = {}
-    # OT
-    with st.expander("OT 파일 컬럼 매핑"):
-        colmap["ot_dept_col"] = st.text_input("부서 컬럼명", value="부서")
-        colmap["ot_name_col"] = st.text_input("이름 컬럼명", value="이름")
-        colmap["ot_hours_col"] = st.text_input("OT(인정) 시간 컬럼명", value="OT시간")
-    # Leave
-    with st.expander("연차 파일 컬럼 매핑"):
-        colmap["lv_dept_col"] = st.text_input("부서 컬럼명 ", value="부서")
-        colmap["lv_name_col"] = st.text_input("이름 컬럼명 ", value="이름")
-        colmap["lv_days_col"] = st.text_input("연차 사용일수 컬럼명", value="연차사용일수")
-        colmap["lv_base_days"] = st.number_input("연차 부여 기본일수(없으면 15)", min_value=1, max_value=30, value=15)
-    # Project
-    with st.expander("프로젝트 실적 파일 컬럼 매핑"):
-        colmap["prj_dept_col"] = st.text_input("부서 컬럼명  ", value="부서")
-        colmap["prj_name_col"] = st.text_input("이름 컬럼명  ", value="이름")
-        colmap["prj_target_col"] = st.text_input("신청등급 컬럼명", value="신청등급")
-        colmap["prj_final_col"]  = st.text_input("확정등급 컬럼명", value="확정등급")
-        colmap["prj_score_col"]  = st.text_input("실적평가점수(0~100) 컬럼명", value="avg_score")
-        colmap["prj_status_col"] = st.text_input("상태 컬럼명(선택, 승인/완료만 집계)", value="status")
-        colmap["prj_level_col"]  = st.text_input("직급/레벨 컬럼명(선택, Level 1만 집계)", value="level")
-        st.write("등급 가중치(참고):", DEFAULT_GRADE_WEIGHTS)
+# 파일 업로드
+st.sidebar.subheader("1️⃣ 파일 업로드")
+ot_file = st.sidebar.file_uploader(
+    "초과근무 파일", 
+    type=['xlsx', 'xls'],
+    help="'총계'와 '일별현황_A' 시트가 포함된 엑셀 파일"
+)
+lv_file = st.sidebar.file_uploader(
+    "연차 파일", 
+    type=['xlsx', 'xls'],
+    help="부서/이름/부여/사용/잔여 정보가 포함된 엑셀 파일"
+)
 
-    st.header("③ 필터/옵션")
-    dept_filter = st.text_input("부서 필터(부분일치)", value="")
+# 옵션 설정
+st.sidebar.subheader("2️⃣ 옵션 설정")
+dept_filter = st.sidebar.text_input(
+    "부서 필터 (선택사항)", 
+    value="",
+    placeholder="예: 전략기획",
+    help="특정 부서만 보려면 입력하세요"
+)
 
-    run = st.button("📊 점수 계산", type="primary",
-                    disabled=not (ot_file and lv_file and prj_file))
+leave_sheet = st.sidebar.text_input(
+    "연차 시트명 (선택사항)", 
+    value="",
+    placeholder="비워두면 첫 시트 사용",
+    help="특정 시트를 지정하려면 입력하세요"
+)
 
-def _show_help():
-    with st.expander("계산 방식 요약", expanded=False):
-        st.markdown(
-            """
-            - **효율화 지수**: 신청등급 가중치 합(기준만점) 대비, 확정등급 가중치×(실적점수/100)의 합(실제달성)의 **달성률(%)**로 산출.  
-            - **달성률→효율화 점수(–3~+3)**  
-              ≥110%:+3 / 100~109:+2.5 / 90~99:+2 / 80~89:+1 / 70~79:+0.5 / 60~69:0 / 50~59:-0.5 / 40~49:-1.5 / <40:-3
-            - **최종지수** = OT점수 + 연차점수 + 효율화점수
-            """
-        )
+# 메인 영역
+col1, col2 = st.columns([3, 1])
 
-_show_help()
+with col1:
+    st.subheader("📤 업로드된 파일")
+    if ot_file:
+        st.success(f"✅ 초과근무 파일: {ot_file.name}")
+    else:
+        st.info("⏳ 초과근무 파일을 업로드해주세요")
+    
+    if lv_file:
+        st.success(f"✅ 연차 파일: {lv_file.name}")
+    else:
+        st.info("⏳ 연차 파일을 업로드해주세요")
 
-def _dfu(d):
-    st.dataframe(d, use_container_width=True, hide_index=True)
+with col2:
+    st.subheader("🎯 실행")
+    calculate_btn = st.button(
+        "📊 점수 계산", 
+        type="primary",
+        disabled=(ot_file is None or lv_file is None),
+        use_container_width=True
+    )
 
-if run:
+st.markdown("---")
+
+# 계산 실행
+if calculate_btn and ot_file is not None and lv_file is not None:
     try:
-        result, parts = compute_total_score(
-            overtime_file=ot_file,
-            leave_file=lv_file,
-            project_file=prj_file,
-            dept_filter=dept_filter or None,
-            column_map=colmap,
+        with st.spinner("⏳ 계산 중... 잠시만 기다려주세요"):
+            # 점수 계산
+            result = compute_total_score(
+                ot_file, 
+                lv_file, 
+                dept_filter=dept_filter if dept_filter else None,
+                leave_sheet=leave_sheet if leave_sheet else None
+            )
+
+        # === 컬럼 표준화: 최종점수 컬럼명을 '최종점수'로 통일 ===
+        final_candidates = ["최종점수(–2~+3)", "최종점수(–6~+6)", "최종점수"]
+        final_col = None
+        for c in final_candidates:
+            if c in result.columns:
+                final_col = c
+                break
+        if final_col is None:
+            raise KeyError("결과에서 '최종점수' 컬럼을 찾을 수 없습니다.")
+
+        if final_col != "최종점수":
+            result = result.rename(columns={final_col: "최종점수"})
+
+        st.success("✅ 계산 완료!")
+        
+        # 결과 표시
+        st.subheader("📊 최종 결과")
+        
+        # 통계 요약
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("전체 부서 수", len(result))
+        with col2:
+            avg_ot = result["OT점수"].mean()
+            st.metric("평균 OT점수", f"{avg_ot:.2f}")
+        with col3:
+            avg_leave = result["연차점수"].mean()
+            st.metric("평균 연차점수", f"{avg_leave:.2f}")
+        with col4:
+            avg_total = result["최종점수"].mean()
+            st.metric("평균 최종점수", f"{avg_total:.2f}")
+        
+        st.markdown("---")
+        
+        # 결과 테이블
+        st.dataframe(
+            result,
+            use_container_width=True,
+            height=400,
+            column_config={
+                "부서": st.column_config.TextColumn("부서", width="medium"),
+                "OT점수": st.column_config.NumberColumn(
+                    "OT점수",
+                    format="%.2f",
+                    help="초과근무 점수 (–1 ~ +2)"
+                ),
+                "연차점수": st.column_config.NumberColumn(
+                    "연차점수",
+                    format="%.2f",
+                    help="연차 점수 (–1 ~ +1)"
+                ),
+                "최종점수": st.column_config.NumberColumn(
+                    "최종점수",
+                    format="%.2f",
+                    help="OT(–1~+2) + 연차(–1~+1) = (–2~+3)"
+                ),
+            }
         )
-        st.success("계산 완료!")
-
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: st.metric("평균 OT점수", f"{result['OT점수'].mean():.2f}")
-        with c2: st.metric("평균 연차점수", f"{result['연차점수'].mean():.2f}")
-        with c3: st.metric("평균 효율화점수", f"{result['효율화점수'].mean():.2f}")
-        with c4: st.metric("평균 달성률(%)", f"{result['달성률(%)'].mean():.1f}")
-
-        st.subheader("부서별 결과")
-        st.dataframe(result, use_container_width=True, hide_index=True)
-
-        st.subheader("시각화")
-        st.bar_chart(result.set_index("부서")["효율화점수"])
-        st.bar_chart(result.set_index("부서")["달성률(%)"])
-
-        csv = result.to_csv(index=False, encoding="utf-8-sig")
-        st.download_button("CSV 다운로드", data=csv, file_name="leadership_scores.csv", mime="text/csv")
-
-        with st.expander("세부 집계 (OT/연차/프로젝트)", expanded=False):
-            st.markdown("**OT 집계**")
-            _dfu(parts.get("ot", pd.DataFrame()))
-            st.markdown("**연차 집계**")
-            _dfu(parts.get("leave", pd.DataFrame()))
-            st.markdown("**프로젝트 집계(효율화)**")
-            _dfu(parts.get("eff", pd.DataFrame()))
-
+        
+        # 시각화
+        st.subheader("📈 점수 분포")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.bar_chart(
+                result.set_index("부서")["OT점수"],
+                use_container_width=True
+            )
+            st.caption("OT 점수 분포 (–1 ~ +2)")
+        
+        with col2:
+            st.bar_chart(
+                result.set_index("부서")["연차점수"],
+                use_container_width=True
+            )
+            st.caption("연차 점수 분포 (–1 ~ +1)")
+        
+        st.bar_chart(
+            result.set_index("부서")["최종점수"],
+            use_container_width=True
+        )
+        st.caption("최종 점수 분포 (–2 ~ +3)")
+        
+        # CSV 다운로드
+        st.markdown("---")
+        st.subheader("💾 결과 다운로드")
+        
+        csv = result.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
+        st.download_button(
+            label="📥 CSV 파일 다운로드",
+            data=csv,
+            file_name="leadership_scores.csv",
+            mime="text/csv",
+            use_container_width=True,
+            type="primary"
+        )
+    
     except Exception as e:
-        st.exception(e)
+        st.error(f"❌ 오류 발생: {str(e)}")
+        
+        # 디버깅 정보 (선택적으로 표시)
+        with st.expander("🔍 상세 오류 정보 (개발자용)", expanded=False):
+            st.exception(e)
+            st.code(f"""
+파일 정보:
+- OT 파일: {ot_file.name if ot_file else 'None'}
+- 연차 파일: {lv_file.name if lv_file else 'None'}
+- 부서 필터: {dept_filter if dept_filter else 'None'}
+- 연차 시트: {leave_sheet if leave_sheet else 'None'}
+현재 컬럼: {list(result.columns) if 'result' in locals() else 'N/A'}
+            """)
+
+# 푸터
+st.markdown("---")
+st.markdown(
+    """
+    <div style='text-align: center; color: gray; padding: 20px;'>
+        <p>리더십 점수 자동 산출 시스템 v1.1</p>
+        <p>문의사항이 있으시면 관리자에게 연락해주세요.</p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
