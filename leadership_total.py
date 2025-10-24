@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 리더십 평가 통합 점수 산출기 (전체 파일)
-- 초과근무 점수(–3~+3) + 연차 점수(–3~+3) = 최종 점수(–6~+6)
+- 초과근무 점수(–1~+2) + 연차 점수(–1~+1) = 최종 점수(–2~+3)
 - 초과근무: '총계' + '일별현황_A' 시트 사용 (부서/직급/이름/환산/신청일 등 자동 감지)
 - 연차: 첫 시트(또는 지정 시트)에서 부서/이름/부여/사용/잔여 자동 감지
 - 결과: 부서별 OT점수, 연차점수, 최종점수 출력 및 CSV 저장
@@ -95,31 +95,40 @@ def _pick_time_col(df):
     return best_col
 
 # -----------------------
-# 초과근무 → 점수(–3~+3)
+# 초과근무 → 점수(–1~+2)
 # -----------------------
 def residual_to_score_ot(residual_pct: float) -> float:
     """
-    Residual(%) → OT 점수(–3~+3)
-    (기관 방침에 맞게 경계 조절 가능)
+    Residual(%) → OT 점수(–1~+2)
+    - Residual = AOR - EOR
+    - 음수(예상보다 적은 OT)는 가점, 양수는 감점
+    - 조직 메시지: '관리잔차를 줄일수록 +, 과다 OT는 -'를 유지하되, 가감폭을 –1~+2로 제한
     """
-    if residual_pct <= -10:
-        return 3.0
-    elif residual_pct <= -7:
+    r = residual_pct
+
+    # 가점(최대 +2)
+    if r <= -10:
         return 2.0
-    elif residual_pct <= -4:
+    elif r <= -6:
+        return 1.5
+    elif r <= -3:
         return 1.0
-    elif residual_pct <= -1:
+    elif r <= -1:
         return 0.5
-    elif residual_pct < 1:
+
+    # 중립
+    if -1 < r < 1:
         return 0.0
-    elif residual_pct < 4:
+
+    # 감점(최대 -1)
+    if r < 3:
+        return -0.25
+    elif r < 6:
         return -0.5
-    elif residual_pct < 7:
-        return -1.0
-    elif residual_pct < 10:
-        return -2.0
+    elif r < 10:
+        return -0.75
     else:
-        return -3.0
+        return -1.0
 
 def compute_overtime_score(excel_path_or_buffer, dept_filter: str | None = None):
     """
@@ -205,7 +214,7 @@ def compute_overtime_score(excel_path_or_buffer, dept_filter: str | None = None)
     return ot_out
 
 # -----------------------
-# 연차 → 점수(–3~+3)
+# 연차 → 점수(–1~+1)
 # -----------------------
 def _looks_hhmm(val: str) -> bool:
     return bool(re.match(r"^\s*\d{1,3}:\d{2}\s*$", str(val or "")))
@@ -383,15 +392,19 @@ def compute_leave_score(excel_path_or_buffer, dept_filter: str | None = None, sh
 
     grp["잔여율(%)"] = (grp["잔여합"] / grp["부여합"].replace(0, np.nan) * 100.0).fillna(0.0).clip(0, 100)
 
-    # 잔여율 → 점수(–3~+3)
-    def leave_score(remain_pct):
-        if remain_pct <= 2: return 3.0
-        elif remain_pct <= 5: return 2.0
-        elif remain_pct <= 10: return 1.0
-        elif remain_pct <= 20: return 0.0
-        elif remain_pct <= 30: return -1.0
-        elif remain_pct <= 40: return -2.0
-        else: return -3.0
+    # 잔여율 → 점수(–1~+1)  ★ 변경된 구간표
+    def leave_score(remain_pct: float) -> float:
+        """
+        잔여율(%) → 연차 점수(–1~+1)
+        - 잔여율이 낮을수록(연차 사용이 계획대로) 가점
+        """
+        if remain_pct <= 2:   return 1.0
+        elif remain_pct <= 5: return 0.75
+        elif remain_pct <= 10:return 0.5
+        elif remain_pct <= 20:return 0.25
+        elif remain_pct <= 30:return 0.0
+        elif remain_pct <= 40:return -0.5
+        else:                 return -1.0
 
     grp["연차점수"] = grp["잔여율(%)"].apply(leave_score)
 
@@ -406,10 +419,10 @@ def compute_total_score(overtime_file, leave_file, dept_filter: str | None = Non
     ot = compute_overtime_score(overtime_file, dept_filter)
     lv = compute_leave_score(leave_file, dept_filter, sheet_name=leave_sheet)
     merged = pd.merge(ot, lv, on="부서", how="outer").fillna(0.0)
-    merged["최종점수(–6~+6)"] = merged["OT점수"] + merged["연차점수"]
+    merged["최종점수(–2~+3)"] = merged["OT점수"] + merged["연차점수"]
     # 보기 좋게
-    merged = merged[["부서", "OT점수", "연차점수", "최종점수(–6~+6)"]].sort_values(
-        by=["최종점수(–6~+6)", "OT점수", "연차점수"], ascending=[False, False, False]
+    merged = merged[["부서", "OT점수", "연차점수", "최종점수(–2~+3)"]].sort_values(
+        by=["최종점수(–2~+3)", "OT점수", "연차점수"], ascending=[False, False, False]
     ).reset_index(drop=True)
     return merged
 
@@ -432,7 +445,7 @@ if __name__ == "__main__":
 
     try:
         result = compute_total_score(ot_file, lv_file, dept_filter=dept, leave_sheet=leave_sheet)
-        print("\n=== 최종 리더십 점수 (–6~+6) ===")
+        print("\n=== 최종 리더십 점수 (–2~+3) ===")
         print(result.to_string(index=False))
 
         # CSV 저장 (엑셀에서 바로 열 수 있도록 utf-8-sig)
