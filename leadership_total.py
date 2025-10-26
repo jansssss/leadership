@@ -3,7 +3,8 @@
 리더십 평가 통합 점수 산출기 (전체 파일)
 - OT 점수: –1 ~ +2
 - 연차 점수: –1 ~ +1
-- 최종 점수: –2 ~ +3 (= OT + 연차)
+- 업무적절성 점수: –1 ~ +2
+- 최종 점수: –3 ~ +5 (= OT + 연차 + 업무적절성)
 
 설계 포인트
 - 초과근무: '총계' + '일별현황_A' 시트 사용 (부서/직급/이름/환산/신청일 등 자동 감지)
@@ -12,6 +13,7 @@
 - AOR(실제 초과근무율) = 팀 OT ÷ (팀 AH + 팀 OT)
 - Residual(%) = AOR – EOR
 - 연차: 첫 시트(또는 지정 시트)에서 부서/이름/부여/사용/잔여 자동 감지
+- 업무적절성: 달성률(%) 기반으로 점수 산정
 """
 
 import os
@@ -229,6 +231,84 @@ def compute_overtime_score(excel_path_or_buffer, dept_filter: str | None = None)
     return ot_out
 
 # -----------------------
+# 업무적절성 → 점수(–1~+2)
+# -----------------------
+def appropriateness_to_score(achievement_pct: float) -> float:
+    """
+    달성률(%) → 업무적절성 점수(–1~+2)
+    - 달성률이 높을수록 가점
+    """
+    r = float(achievement_pct)
+
+    # 가점(최대 +2)
+    if r >= 100:
+        return 2.0
+    elif r >= 90:
+        return 1.5
+    elif r >= 80:
+        return 1.0  # 우수
+    elif r >= 70:
+        return 0.5
+
+    # 중립
+    if 60 <= r < 70:
+        return 0.0  # 보통
+
+    # 감점(최대 -1)
+    if r >= 50:
+        return -0.5
+    else:
+        return -1.0  # 미흡
+
+def compute_appropriateness_score(excel_path_or_buffer, dept_filter: str | None = None, sheet_name: str | None = None):
+    """
+    업무적절성 파일 → 부서별 업무적절성점수 DataFrame[부서, 업무적절성점수]
+    """
+    # Streamlit UploadedFile 객체 처리
+    if hasattr(excel_path_or_buffer, 'seek'):
+        excel_path_or_buffer.seek(0)
+
+    # 시트 선택
+    xls = pd.ExcelFile(excel_path_or_buffer)
+    use_sheet = sheet_name if (sheet_name and sheet_name in xls.sheet_names) else xls.sheet_names[0]
+
+    df = pd.read_excel(excel_path_or_buffer, sheet_name=use_sheet)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # 컬럼 자동 감지
+    dept_col = None
+    for cand in ["실/센터", "부서", "소속", "센터", "실센터"]:
+        if cand in df.columns:
+            dept_col = cand
+            break
+
+    achievement_col = None
+    for cand in ["달성률(%)", "달성률", "달성률 (%)", "달성율(%)"]:
+        if cand in df.columns:
+            achievement_col = cand
+            break
+
+    if not dept_col:
+        raise ValueError("업무적절성 시트에서 부서 컬럼(실/센터, 부서 등)을 찾지 못했습니다.")
+    if not achievement_col:
+        raise ValueError("업무적절성 시트에서 달성률 컬럼을 찾지 못했습니다.")
+
+    # 데이터 정제
+    df["_부서"] = df[dept_col].apply(_norm)
+    df["_달성률"] = pd.to_numeric(df[achievement_col], errors="coerce").fillna(0.0)
+
+    # 부서별 점수 계산
+    result = df[["_부서", "_달성률"]].copy()
+    result = result[result["_부서"] != ""]  # 빈 부서명 제외
+    result["업무적절성점수"] = result["_달성률"].apply(appropriateness_to_score)
+    result = result.rename(columns={"_부서": "부서"})
+
+    if dept_filter:
+        result = result[result["부서"].str.contains(dept_filter, na=False)]
+
+    return result[["부서", "업무적절성점수"]]
+
+# -----------------------
 # 연차 → 점수(–1~+1)
 # -----------------------
 def _looks_hhmm(val: str) -> bool:
@@ -413,20 +493,38 @@ def compute_leave_score(excel_path_or_buffer, dept_filter: str | None = None, sh
 # -----------------------
 # 통합 최종 계산
 # -----------------------
-def compute_total_score(overtime_file, leave_file, dept_filter: str | None = None, leave_sheet: str | None = None):
+def compute_total_score(overtime_file, leave_file, appropriateness_file=None, dept_filter: str | None = None, leave_sheet: str | None = None, appropriateness_sheet: str | None = None):
+    """
+    OT + 연차 + 업무적절성 통합 점수 계산
+    - OT: –1 ~ +2
+    - 연차: –1 ~ +1
+    - 업무적절성: –1 ~ +2
+    - 최종: –3 ~ +5
+    """
     ot = compute_overtime_score(overtime_file, dept_filter)
     lv = compute_leave_score(leave_file, dept_filter, sheet_name=leave_sheet)
+
+    # OT + 연차 병합
     merged = pd.merge(ot, lv, on="부서", how="outer").fillna(0.0)
 
-    # 최종점수 계산 (–2~+3)
-    merged["최종점수(–2~+3)"] = merged["OT점수"] + merged["연차점수"]
+    # 업무적절성 추가 (파일이 제공된 경우)
+    if appropriateness_file is not None:
+        ap = compute_appropriateness_score(appropriateness_file, dept_filter, sheet_name=appropriateness_sheet)
+        merged = pd.merge(merged, ap, on="부서", how="outer").fillna(0.0)
+    else:
+        # 업무적절성 파일이 없으면 0점 처리
+        merged["업무적절성점수"] = 0.0
+
+    # 최종점수 계산 (–3~+5)
+    merged["최종점수(–3~+5)"] = merged["OT점수"] + merged["연차점수"] + merged["업무적절성점수"]
 
     # 호환성(예전 프런트 사용 시): 옛 컬럼명도 함께 제공
-    merged["최종점수(–6~+6)"] = merged["최종점수(–2~+3)"]
+    merged["최종점수(–2~+3)"] = merged["OT점수"] + merged["연차점수"]  # 업무적절성 제외
+    merged["최종점수(–6~+6)"] = merged["최종점수(–3~+5)"]  # 호환성
 
     # 보기 좋게
-    merged = merged[["부서", "OT점수", "연차점수", "최종점수(–2~+3)"]].sort_values(
-        by=["최종점수(–2~+3)", "OT점수", "연차점수"], ascending=[False, False, False]
+    merged = merged[["부서", "OT점수", "연차점수", "업무적절성점수", "최종점수(–3~+5)"]].sort_values(
+        by=["최종점수(–3~+5)", "OT점수", "연차점수", "업무적절성점수"], ascending=[False, False, False, False]
     ).reset_index(drop=True)
     return merged
 
